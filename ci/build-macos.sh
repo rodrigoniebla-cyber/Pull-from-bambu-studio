@@ -126,11 +126,16 @@ log "Built app bundle: $APP_BUNDLE"
 log "Making the app bundle relocatable (rewriting any absolute build-machine"
 log "library paths so it doesn't crash with a dyld error on another Mac)"
 # --------------------------------------------------------------------------
-# Everything is built with prefixes under $BUILD_DIR (the deps DESTDIR and the
-# BambuStudio checkout itself). Any dylib the app links against that still
-# points into $BUILD_DIR only exists on this CI runner - copy those into
-# Contents/Frameworks, rewrite the references to @rpath, and re-sign, so the
-# app runs on a Mac that never had $BUILD_DIR.
+# Most of the app is built with prefixes under $BUILD_DIR (the deps DESTDIR
+# and the BambuStudio checkout itself), but some of the from-source deps'
+# CMake configure steps find and link against a Homebrew-provided library
+# already present on the runner instead of building their own (this is how a
+# real crash happened: BambuStudio.app ended up depending on this CI runner's
+# /opt/homebrew/*/libzstd.1.dylib, which obviously isn't on anyone else's
+# Mac). Anything the app links against under $BUILD_DIR, /opt/homebrew, or
+# /usr/local (Homebrew's Apple Silicon and Intel prefixes) only exists on
+# this CI runner - copy those into Contents/Frameworks, rewrite the
+# references to @rpath, and re-sign, so the app is fully self-contained.
 fixup_app_bundle() {
   local app="$1"
   local frameworks="$app/Contents/Frameworks"
@@ -160,7 +165,7 @@ fixup_app_bundle() {
     while IFS= read -r dep; do
       [ -n "$dep" ] || continue
       case "$dep" in
-        "$BUILD_DIR"/*)
+        "$BUILD_DIR"/*|/opt/homebrew/*|/usr/local/*)
           libname="$(basename "$dep")"
           dest="$frameworks/$libname"
           if [ ! -f "$dest" ]; then
