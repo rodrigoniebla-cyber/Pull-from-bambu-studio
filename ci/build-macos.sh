@@ -111,7 +111,6 @@ mkdir -p "$SRC_DIR/build"
     -DCMAKE_OSX_ARCHITECTURES="$ARCH" \
     -DCMAKE_OSX_DEPLOYMENT_TARGET="$MIN_OSX_VERSION" \
     -DCMAKE_MACOSX_RPATH=ON \
-    -DCMAKE_INSTALL_RPATH="$DEPS_DIR/usr/local" \
     -DCMAKE_MACOSX_BUNDLE=on \
     -G Ninja
 
@@ -122,6 +121,70 @@ mkdir -p "$SRC_DIR/build"
 APP_BUNDLE="$(find "$INSTALL_DIR" -maxdepth 2 -name '*.app' -print -quit)"
 [ -n "$APP_BUNDLE" ] && [ -d "$APP_BUNDLE" ] || die "no .app bundle found under $INSTALL_DIR after install"
 log "Built app bundle: $APP_BUNDLE"
+
+# --------------------------------------------------------------------------
+log "Making the app bundle relocatable (rewriting any absolute build-machine"
+log "library paths so it doesn't crash with a dyld error on another Mac)"
+# --------------------------------------------------------------------------
+# Everything is built with prefixes under $BUILD_DIR (the deps DESTDIR and the
+# BambuStudio checkout itself). Any dylib the app links against that still
+# points into $BUILD_DIR only exists on this CI runner - copy those into
+# Contents/Frameworks, rewrite the references to @rpath, and re-sign, so the
+# app runs on a Mac that never had $BUILD_DIR.
+fixup_app_bundle() {
+  local app="$1"
+  local frameworks="$app/Contents/Frameworks"
+  mkdir -p "$frameworks"
+
+  local exe
+  exe="$(find "$app/Contents/MacOS" -maxdepth 1 -type f -perm -111 -print -quit)"
+  [ -n "$exe" ] || die "no executable found under $app/Contents/MacOS"
+
+  local -a queue=("$exe")
+  local -a seen=()
+  local bin dep libname dest already_seen s
+
+  while [ "${#queue[@]}" -gt 0 ]; do
+    bin="${queue[0]}"
+    queue=("${queue[@]:1}")
+
+    already_seen=0
+    for s in "${seen[@]}"; do
+      [ "$s" = "$bin" ] && { already_seen=1; break; }
+    done
+    [ "$already_seen" = 1 ] && continue
+    seen+=("$bin")
+    [ -f "$bin" ] || continue
+    chmod u+w "$bin" 2>/dev/null || true
+
+    while IFS= read -r dep; do
+      [ -n "$dep" ] || continue
+      case "$dep" in
+        "$BUILD_DIR"/*)
+          libname="$(basename "$dep")"
+          dest="$frameworks/$libname"
+          if [ ! -f "$dest" ]; then
+            cp -L "$dep" "$dest"
+            chmod u+w "$dest"
+            queue+=("$dest")
+          fi
+          install_name_tool -change "$dep" "@rpath/$libname" "$bin"
+          ;;
+      esac
+    done < <(otool -L "$bin" | tail -n +2 | awk '{print $1}')
+
+    case "$bin" in
+      "$frameworks"/*) install_name_tool -id "@rpath/$(basename "$bin")" "$bin" 2>/dev/null || true ;;
+    esac
+  done
+
+  otool -l "$exe" | grep -q "@executable_path/../Frameworks" \
+    || install_name_tool -add_rpath "@executable_path/../Frameworks" "$exe"
+
+  log "Ad-hoc code-signing $app (unnotarized - Gatekeeper will still require right-click Open on first launch)"
+  codesign --force --deep --sign - "$app"
+}
+fixup_app_bundle "$APP_BUNDLE"
 
 # --------------------------------------------------------------------------
 log "Packaging $DMG_NAME"
