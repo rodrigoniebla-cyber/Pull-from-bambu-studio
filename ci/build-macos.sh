@@ -36,8 +36,13 @@ MIN_OSX_VERSION="${MIN_OSX_VERSION:-11.0}"
 SKIP_RELEASE="${SKIP_RELEASE:-0}"
 NPROC="$(sysctl -n hw.ncpu)"
 
-SRC_DIR="$REPO_ROOT/BambuStudio"
-DEPS_DIR="$REPO_ROOT/BambuStudio_dep"
+# Nested under build/ deliberately: macOS's default filesystem (APFS) is
+# case-insensitive, so a top-level clone directory named "BambuStudio" would
+# collide with this repo's existing "bambustudio/" folder (the vendored port
+# sources apply.sh copies from) and cp would refuse to copy onto itself.
+BUILD_DIR="$REPO_ROOT/build"
+SRC_DIR="$BUILD_DIR/BambuStudio"
+DEPS_DIR="$BUILD_DIR/BambuStudio_dep"
 DEPS_TARBALL="$REPO_ROOT/BambuStudio_dep_mac_${ARCH}.tar.gz"
 INSTALL_DIR="$SRC_DIR/install_dir"
 VERSION="02.08.02.61-imagemap"
