@@ -23,7 +23,7 @@ jobs:
 
       - name: Restore deps cache
         id: cache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: BambuStudio_dep_mac_arm64.tar.gz
           key: bs-deps-macos26-arm64-926a7192
