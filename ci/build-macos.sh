@@ -54,6 +54,10 @@ log "Config: ARCH=$ARCH MIN_OSX_VERSION=$MIN_OSX_VERSION NPROC=$NPROC"
 # --------------------------------------------------------------------------
 log "Installing build prerequisites via Homebrew"
 # --------------------------------------------------------------------------
+command -v brew >/dev/null || die "Homebrew not found. Install it from https://brew.sh, then re-run this script:
+  /bin/bash -c \"\$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)\"
+  echo 'eval \"\$(/opt/homebrew/bin/brew shellenv)\"' >> ~/.zprofile   # Apple Silicon path; use /usr/local on Intel
+  eval \"\$(/opt/homebrew/bin/brew shellenv)\""
 brew install cmake ninja gettext nasm yasm x264 >/dev/null
 
 # --------------------------------------------------------------------------
