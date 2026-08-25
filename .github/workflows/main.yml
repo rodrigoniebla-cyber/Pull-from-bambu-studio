@@ -3,8 +3,8 @@ name: Build macOS DMG (ImageMap port)
 on:
   workflow_dispatch:
   push:
-    branches: [arena/01a03659-pull-from-bambu-studio]
-    paths: ['ci/**', '.github/workflows/build-macos-dmg.yml']
+    branches: [claude/build-for-mac-uwtra6, main]
+    paths: ['ci/**', '.github/workflows/main.yml']
 
 permissions:
   contents: write
