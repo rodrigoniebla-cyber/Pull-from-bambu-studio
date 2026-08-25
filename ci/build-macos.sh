@@ -140,20 +140,20 @@ fixup_app_bundle() {
   exe="$(find "$app/Contents/MacOS" -maxdepth 1 -type f -perm -111 -print -quit)"
   [ -n "$exe" ] || die "no executable found under $app/Contents/MacOS"
 
+  # macOS's system bash is the ancient 3.2 (last GPLv2 release), which has a
+  # known bug: expanding a zero-element array with "${arr[@]}" under `set -u`
+  # throws "unbound variable" instead of expanding to nothing. Track "seen"
+  # as a delimited string instead of an array to sidestep it entirely.
   local -a queue=("$exe")
-  local -a seen=()
-  local bin dep libname dest already_seen s
+  local seen=$'\n'
+  local bin dep libname dest
 
   while [ "${#queue[@]}" -gt 0 ]; do
     bin="${queue[0]}"
     queue=("${queue[@]:1}")
 
-    already_seen=0
-    for s in "${seen[@]}"; do
-      [ "$s" = "$bin" ] && { already_seen=1; break; }
-    done
-    [ "$already_seen" = 1 ] && continue
-    seen+=("$bin")
+    case "$seen" in *$'\n'"$bin"$'\n'*) continue ;; esac
+    seen="$seen$bin"$'\n'
     [ -f "$bin" ] || continue
     chmod u+w "$bin" 2>/dev/null || true
 
