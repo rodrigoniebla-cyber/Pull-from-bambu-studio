@@ -1,0 +1,146 @@
+#!/bin/bash
+# Build Bambu Studio (arm64) with the OrcaSlicer-ImageMap "one tool-change per
+# layer" port applied, and package the result as a DMG.
+#
+# Runs on a GitHub Actions macOS runner via .github/workflows/main.yml, but
+# also works on a real Mac: just run `ci/build-macos.sh` from a checkout of
+# this repository.
+#
+# Env vars (all optional):
+#   ARCH              arm64 | x86_64   (default: uname -m)
+#   MIN_OSX_VERSION    deployment target (default: 11.0)
+#   SKIP_RELEASE       1 to skip publishing a GitHub release (default: 0)
+#   GH_TOKEN           used by `gh` to publish a release, if set and not skipped
+
+set -euo pipefail
+
+log() { printf '\n\033[1;34m==>\033[0m %s\n' "$*"; }
+die() { printf '\n\033[1;31merror:\033[0m %s\n' "$*" >&2; exit 1; }
+trap 'die "build failed at line $LINENO (last command: $BASH_COMMAND)"' ERR
+
+REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$REPO_ROOT"
+
+BASE_COMMIT="926a7192574bcb9b3a732e1ec59a46d79cb45466"   # v02.08.02.61, the base the ImageMap patch was made against
+UPSTREAM_URL="https://github.com/bambulab/BambuStudio.git"
+
+ARCH="${ARCH:-$(uname -m)}"
+[ "$ARCH" = "aarch64" ] && ARCH="arm64"
+case "$ARCH" in
+  arm64|x86_64) ;;
+  *) die "unsupported ARCH '$ARCH' (expected arm64 or x86_64)" ;;
+esac
+MIN_OSX_VERSION="${MIN_OSX_VERSION:-11.0}"
+SKIP_RELEASE="${SKIP_RELEASE:-0}"
+NPROC="$(sysctl -n hw.ncpu)"
+
+SRC_DIR="$REPO_ROOT/BambuStudio"
+DEPS_DIR="$REPO_ROOT/BambuStudio_dep"
+DEPS_TARBALL="$REPO_ROOT/BambuStudio_dep_mac_${ARCH}.tar.gz"
+INSTALL_DIR="$SRC_DIR/install_dir"
+VERSION="02.08.02.61-imagemap"
+DMG_NAME="BambuStudio_${ARCH}_${VERSION}_ImageMap.dmg"
+DMG_PATH="$REPO_ROOT/$DMG_NAME"
+
+log "Config: ARCH=$ARCH MIN_OSX_VERSION=$MIN_OSX_VERSION NPROC=$NPROC"
+
+# --------------------------------------------------------------------------
+log "Installing build prerequisites via Homebrew"
+# --------------------------------------------------------------------------
+brew install cmake ninja gettext nasm yasm x264 >/dev/null
+
+# --------------------------------------------------------------------------
+log "Fetching BambuStudio @ ${BASE_COMMIT:0:12} (v${VERSION%-imagemap})"
+# --------------------------------------------------------------------------
+if [ ! -d "$SRC_DIR/.git" ]; then
+  mkdir -p "$SRC_DIR"
+  git -C "$SRC_DIR" init -q
+  git -C "$SRC_DIR" remote add origin "$UPSTREAM_URL"
+  if ! git -C "$SRC_DIR" fetch --depth 1 origin "$BASE_COMMIT" -q; then
+    log "Shallow fetch of pinned commit failed, falling back to full clone"
+    git -C "$SRC_DIR" fetch origin -q
+  fi
+  git -C "$SRC_DIR" checkout -q FETCH_HEAD
+fi
+[ "$(git -C "$SRC_DIR" rev-parse HEAD)" = "$BASE_COMMIT" ] || die "checked out commit doesn't match pinned base commit $BASE_COMMIT"
+
+# --------------------------------------------------------------------------
+log "Applying the ImageMap per-layer-color port"
+# --------------------------------------------------------------------------
+"$REPO_ROOT/apply.sh" "$SRC_DIR"
+
+# --------------------------------------------------------------------------
+if [ -f "$DEPS_TARBALL" ]; then
+  log "Restoring cached dependency build from $(basename "$DEPS_TARBALL")"
+  mkdir -p "$DEPS_DIR"
+  tar -xzf "$DEPS_TARBALL" -C "$DEPS_DIR"
+else
+  log "No dependency cache found - building deps from source (this is the slow part, ~1-2h)"
+  mkdir -p "$SRC_DIR/deps/build"
+  (
+    cd "$SRC_DIR/deps/build"
+    cmake .. \
+      -DDESTDIR="$DEPS_DIR" \
+      -DOPENSSL_ARCH="darwin64-${ARCH}-cc" \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_OSX_DEPLOYMENT_TARGET="$MIN_OSX_VERSION"
+    cmake --build . --config Release -j"$NPROC"
+  )
+  log "Caching dependency build to $(basename "$DEPS_TARBALL")"
+  tar -czf "$DEPS_TARBALL" -C "$DEPS_DIR" .
+fi
+
+# --------------------------------------------------------------------------
+log "Configuring BambuStudio"
+# --------------------------------------------------------------------------
+mkdir -p "$SRC_DIR/build"
+(
+  cd "$SRC_DIR/build"
+  cmake .. \
+    -DBBL_RELEASE_TO_PUBLIC=1 \
+    -DCMAKE_PREFIX_PATH="$DEPS_DIR/usr/local" \
+    -DCMAKE_INSTALL_PREFIX="$INSTALL_DIR" \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_OSX_ARCHITECTURES="$ARCH" \
+    -DCMAKE_OSX_DEPLOYMENT_TARGET="$MIN_OSX_VERSION" \
+    -DCMAKE_MACOSX_RPATH=ON \
+    -DCMAKE_INSTALL_RPATH="$DEPS_DIR/usr/local" \
+    -DCMAKE_MACOSX_BUNDLE=on \
+    -G Ninja
+
+  log "Building BambuStudio (this is the other slow part, ~30-60min)"
+  cmake --build . --target install --config Release -j"$NPROC"
+)
+
+APP_BUNDLE="$(find "$INSTALL_DIR" -maxdepth 2 -name '*.app' -print -quit)"
+[ -n "$APP_BUNDLE" ] && [ -d "$APP_BUNDLE" ] || die "no .app bundle found under $INSTALL_DIR after install"
+log "Built app bundle: $APP_BUNDLE"
+
+# --------------------------------------------------------------------------
+log "Packaging $DMG_NAME"
+# --------------------------------------------------------------------------
+STAGE_DIR="$(mktemp -d)"
+trap 'rm -rf "$STAGE_DIR"' EXIT
+cp -R "$APP_BUNDLE" "$STAGE_DIR/"
+ln -s /Applications "$STAGE_DIR/Applications"
+rm -f "$DMG_PATH"
+hdiutil create -volname "BambuStudio ImageMap" -srcfolder "$STAGE_DIR" -ov -format UDZO "$DMG_PATH"
+log "DMG ready: $DMG_PATH ($(du -h "$DMG_PATH" | cut -f1))"
+
+# --------------------------------------------------------------------------
+if [ "$SKIP_RELEASE" != "1" ] && [ -n "${GH_TOKEN:-}" ] && command -v gh >/dev/null; then
+  log "Publishing GitHub release"
+  TAG="imagemap-${VERSION}-$(date +%Y%m%d%H%M)"
+  if gh release create "$TAG" "$DMG_PATH" \
+      --title "BambuStudio ImageMap port ($VERSION)" \
+      --notes "Automated macOS build. Base: bambulab/BambuStudio@${BASE_COMMIT:0:12}. Feature toggle image_map_per_layer_color_rotation is off by default." \
+      --repo "${GITHUB_REPOSITORY:-}"; then
+    log "Release published: tag $TAG"
+  else
+    log "WARNING: release publish failed - the DMG is still available as a workflow artifact"
+  fi
+else
+  log "Skipping release publish (SKIP_RELEASE=$SKIP_RELEASE, GH_TOKEN set: $([ -n "${GH_TOKEN:-}" ] && echo yes || echo no))"
+fi
+
+log "Done."
