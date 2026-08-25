@@ -1,0 +1,500 @@
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index 89214b3..782b213 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -24,6 +24,12 @@ add_subdirectory(libnest2d)
+ # libnoise for structured fuzzy skin (Perlin, Billow, etc.); use dep via CMAKE_PREFIX_PATH
+ find_package(libnoise REQUIRED)
+ 
++# Color-mixing/solver libraries vendored from OrcaSlicer-ImageMap for the
++# image-map per-layer color rotation feature (see src/imagemap/README.md).
++add_subdirectory(imagemap/pigment-painter)
++add_subdirectory(imagemap/prusa-fdm-mixer)
++add_subdirectory(imagemap/colorsolver)
++
+ add_subdirectory(libslic3r)
+ 
+ if (SLIC3R_GUI)
+diff --git a/src/libslic3r/CMakeLists.txt b/src/libslic3r/CMakeLists.txt
+index a432007..430387b 100644
+--- a/src/libslic3r/CMakeLists.txt
++++ b/src/libslic3r/CMakeLists.txt
+@@ -234,6 +234,8 @@ set(lisbslic3r_sources
+     Geometry/VoronoiUtilsCgal.cpp
+     Geometry/VoronoiUtilsCgal.hpp
+     Geometry/VoronoiVisualUtils.hpp
++    ImageMapPerLayerColor.cpp
++    ImageMapPerLayerColor.hpp
+     Int128.hpp
+     InternalBridgeDetector.cpp
+     InternalBridgeDetector.hpp
+@@ -640,6 +642,7 @@ target_link_libraries(libslic3r
+     TBB::tbbmalloc
+     libslic3r_cgal
+     ${CMAKE_DL_LIBS}
++    colorsolver
+     PNG::PNG
+     ZLIB::ZLIB
+     ${OCCT_LIBS}
+diff --git a/src/libslic3r/GCode.cpp b/src/libslic3r/GCode.cpp
+index ac30594..0110300 100644
+--- a/src/libslic3r/GCode.cpp
++++ b/src/libslic3r/GCode.cpp
+@@ -1809,6 +1809,10 @@ void GCode::do_export(Print* print, const char* path, GCodeProcessorResult* resu
+     // BBS
+     m_curr_print = print;
+ 
++    // Image-map per-layer color rotation (ported from OrcaSlicer-ImageMap);
++    // no-op unless image_map_per_layer_color_rotation is enabled.
++    this->init_image_map_per_layer_color(*print);
++
+     CNumericLocalesSetter locales_setter;
+ 
+     // Does the file exist? If so, we hope that it is still valid.
+@@ -7090,8 +7094,95 @@ double GCode::calc_max_volumetric_speed(const double layer_height, const double
+     return res;
+ }
+ 
+-std::string GCode::_extrude(const ExtrusionPath &path, std::string description, double speed, bool use_seperate_speed, bool is_first_slope)
++// ---------------------------------------------------------------------------
++// Image-map per-layer color rotation: outer-wall line-width modulation.
++// Ported from OrcaSlicer-ImageMap
++// (https://github.com/sentientstardust-dev/OrcaSlicer-ImageMap, release
++// v1.0.22, commit 92548381056dbf72836b0a1bdc455f238218dbfb), GCode.cpp outer
++// wall gradient path (ModulationLineWidth mode, lines ~11027-11360 of origin)
++// and TextureMappingOffset.cpp component_weights_for_sample().
++//
++// Phase-1 adaptation: the origin samples an image texture per path segment;
++// here the color target of a painted region is constant (the region's
++// configured filament color), so the solver weight — and therefore the
++// modulated width — is constant per path. The per-segment sampling, dithering
++// and centerline-shift machinery of the origin is Phase 2/3 scope.
++// ---------------------------------------------------------------------------
++
++void GCode::init_image_map_per_layer_color(const Print &print)
++{
++    m_image_map_modulation_enabled = false;
++    if (!ImageMapPerLayer::enabled(print.config()))
++        return; // default OFF — strict no-op
++    // Mirror the guards of ToolOrdering::resolve_image_map_per_layer_filaments()
++    // so modulation is active exactly when tool-change collapsing is.
++    const auto &is_mixed = print.config().filament_is_mixed.values;
++    if (std::any_of(is_mixed.begin(), is_mixed.end(), [](unsigned char v) { return v != 0; }))
++        return;
++    const std::vector<unsigned int> rotation = ImageMapPerLayer::rotation_filaments(print);
++    if (rotation.size() < 2)
++        return;
++    if (!m_image_map_solver.init(print.config(), rotation))
++        return;
++    m_image_map_modulation_enabled = true;
++}
++
++bool GCode::image_map_apply_outer_wall_modulation(const ExtrusionPath &path, ExtrusionPath &out)
++{
++    if (!m_image_map_modulation_enabled)
++        return false;
++    if (path.role() != erExternalPerimeter)
++        return false;
++    // A sloped path (scarf seam / spiral transitions) would lose its slope
++    // data when copied into a plain ExtrusionPath — leave it untouched.
++    if (dynamic_cast<const ExtrusionPathSloped *>(&path) != nullptr)
++        return false;
++    if (path.is_force_no_extrusion() || path.polyline.points.size() < 2)
++        return false;
++    if (m_writer.filament() == nullptr)
++        return false;
++
++    // extrude_perimeters() applies the region config into m_config before
++    // extruding, so wall_filament here is the painted region's original
++    // filament — the color target (same mechanism the origin feature used).
++    const int target_filament = m_config.wall_filament.value - 1;
++    if (target_filament < 0)
++        return false;
++    const unsigned int active_filament = m_writer.filament()->id();
++    const float weight = m_image_map_solver.weight_for(unsigned(target_filament), active_filament);
++    if (weight < 0.f)
++        return false; // active or target filament outside the rotation set
++
++    const float layer_height = path.height > EPSILON ? path.height :
++        float(m_layer != nullptr ? m_layer->height : m_last_height);
++    const float base_width = std::max(0.01f, path.width);
++    const float new_width = ImageMapPerLayer::modulated_outer_wall_width(
++        weight,
++        base_width,
++        float(m_config.texture_mapping_outer_wall_gradient_min_line_width.value),
++        float(m_config.texture_mapping_outer_wall_gradient_max_line_width.value),
++        float(m_config.texture_mapping_outer_wall_gradient_global_strength.value),
++        layer_height);
++    if (std::abs(new_width - base_width) <= 1e-4f)
++        return false;
++
++    out = path;
++    out.width = new_width;
++    out.mm3_per_mm = path.mm3_per_mm *
++        ImageMapPerLayer::flow_scale_for_width_change(base_width, new_width, layer_height);
++    return true;
++}
++
++std::string GCode::_extrude(const ExtrusionPath &path_in, std::string description, double speed, bool use_seperate_speed, bool is_first_slope)
+ {
++    // Image-map per-layer color rotation: optionally re-width the external
++    // perimeter for the layer's active filament. When the feature is disabled
++    // (default) image_map_apply_outer_wall_modulation() returns false without
++    // side effects and `path` aliases `path_in` unchanged.
++    ExtrusionPath image_map_modulated_path;
++    const ExtrusionPath &path = this->image_map_apply_outer_wall_modulation(path_in, image_map_modulated_path) ?
++        image_map_modulated_path : path_in;
++
+     std::string gcode;
+ 
+     if (is_bridge(path.role()))
+diff --git a/src/libslic3r/GCode.hpp b/src/libslic3r/GCode.hpp
+index 5d20282..47f483f 100644
+--- a/src/libslic3r/GCode.hpp
++++ b/src/libslic3r/GCode.hpp
+@@ -20,6 +20,7 @@
+ #include "GCode/ThumbnailData.hpp"
+ #include "libslic3r/ObjectID.hpp"
+ #include "GCode/TimelapsePosPicker.hpp"
++#include "ImageMapPerLayerColor.hpp"
+ 
+ #include <cfloat>
+ #include <memory>
+@@ -651,6 +652,9 @@ private:
+ 
+     // BBS
+     Print* m_curr_print = nullptr;
++    // Image-map per-layer color rotation state (empty/disabled by default).
++    bool m_image_map_modulation_enabled = false;
++    ImageMapPerLayer::Solver m_image_map_solver;
+     unsigned int m_toolchange_count;
+     std::vector<unsigned int> m_filament_change_sequence;
+     std::vector<unsigned int> m_nozzle_change_sequence;
+@@ -674,6 +678,13 @@ private:
+ 
+     double calc_max_volumetric_speed(const double layer_height, const double line_width, const std::string co_str);
+     std::string _extrude(const ExtrusionPath &path, std::string description = "", double speed = -1, bool set_holes_and_compensation_speed = false, bool is_first_slope = false);
++    // Image-map per-layer color rotation (ported from OrcaSlicer-ImageMap):
++    // initialize per-print modulation state; strict no-op when the
++    // image_map_per_layer_color_rotation toggle (default off) is disabled.
++    void init_image_map_per_layer_color(const Print &print);
++    // Returns true and fills `out` when `path` is an external perimeter whose
++    // width must be modulated for the current layer's active filament.
++    bool image_map_apply_outer_wall_modulation(const ExtrusionPath &path, ExtrusionPath &out);
+     ExtrusionPaths set_speed_transition(std::vector<ExtrusionPaths> &paths);
+     void split_and_mapping_speed(double other_path_v, double final_v, ExtrusionPaths &this_path, double max_smooth_length, ExtrusionPaths &interpolated_paths, bool split_from_left = true);
+     bool is_enable_overhang_speed();
+diff --git a/src/libslic3r/GCode/ToolOrdering.cpp b/src/libslic3r/GCode/ToolOrdering.cpp
+index 9d429b0..1d85c9c 100644
+--- a/src/libslic3r/GCode/ToolOrdering.cpp
++++ b/src/libslic3r/GCode/ToolOrdering.cpp
+@@ -10,6 +10,7 @@
+ #include "PresetBundle.hpp"
+ #include "MultiNozzleUtils.hpp"
+ #include "FilamentMixer.hpp"
++#include "ImageMapPerLayerColor.hpp"
+ #include "LocalesUtils.hpp"
+ #include "Utils.hpp"
+ 
+@@ -123,21 +124,21 @@ unsigned int LayerTools::wall_filament(const PrintRegion &region) const
+ {
+ 	assert(region.config().wall_filament.value > 0);
+ 	unsigned int result = ((this->extruder_override == 0) ? region.config().wall_filament.value : this->extruder_override) - 1;
+-	return resolve_mixed(result);
++	return resolve_image_map(resolve_mixed(result));
+ }
+ 
+ unsigned int LayerTools::sparse_infill_filament(const PrintRegion &region) const
+ {
+ 	assert(region.config().sparse_infill_filament.value > 0);
+ 	unsigned int result = ((this->extruder_override == 0) ? region.config().sparse_infill_filament.value : this->extruder_override) - 1;
+-	return resolve_mixed(result);
++	return resolve_image_map(resolve_mixed(result));
+ }
+ 
+ unsigned int LayerTools::solid_infill_filament(const PrintRegion &region) const
+ {
+ 	assert(region.config().solid_infill_filament.value > 0);
+ 	unsigned int result = ((this->extruder_override == 0) ? region.config().solid_infill_filament.value : this->extruder_override) - 1;
+-	return resolve_mixed(result);
++	return resolve_image_map(resolve_mixed(result));
+ }
+ 
+ // Returns a zero based extruder this eec should be printed with, according to PrintRegion config or extruder_override if overriden.
+@@ -189,7 +190,7 @@ unsigned int LayerTools::extruder(const ExtrusionEntityCollection &extrusions, c
+     }else
+         extruder = this->extruder_override;
+ 	unsigned int result = (extruder == 0) ? 0 : extruder - 1;
+-	return resolve_mixed(result);
++	return resolve_image_map(resolve_mixed(result));
+ }
+ 
+ static double calc_max_layer_height(const PrintConfig &config, double max_object_layer_height)
+@@ -392,6 +393,7 @@ void ToolOrdering::sort_and_build_data(const Print& print, unsigned int first_ex
+     // so we shouldn't reorder first layer in reorder function
+     bool reorder_first_layer = (first_extruder != (unsigned int)(-1));
+     this->resolve_mixed_filaments(print.config());
++    this->resolve_image_map_per_layer_filaments(print.config());
+     reorder_extruders_for_minimum_flush_volume(reorder_first_layer);
+     this->enforce_mixed_component_order();
+     m_sorted = true;
+@@ -424,6 +426,7 @@ void ToolOrdering::sort_and_build_data(const PrintObject& object , unsigned int
+     //bool reorder_first_layer = (first_extruder != (unsigned int)(-1));
+     bool reorder_first_layer = false; // when by object , the first layer of each object should use the best order, regard less of the filament change for better bed contect
+     this->resolve_mixed_filaments(object.print()->config());
++    this->resolve_image_map_per_layer_filaments(object.print()->config());
+     reorder_extruders_for_minimum_flush_volume(reorder_first_layer);
+     this->enforce_mixed_component_order();
+     m_sorted = true;
+@@ -2625,6 +2628,76 @@ void ToolOrdering::resolve_mixed_filaments(const PrintConfig &config)
+     }
+ }
+ 
++// Image-map per-layer color rotation. Ported from OrcaSlicer-ImageMap
++// (https://github.com/sentientstardust-dev/OrcaSlicer-ImageMap, release
++// v1.0.22, commit 92548381056dbf72836b0a1bdc455f238218dbfb): the origin's
++// ToolOrdering resolves texture-mapping zone ids to a single physical
++// filament per layer via TextureMappingManager::resolve_zone_component().
++// Bambu Studio has no texture zones in Phase 1, so the rotation set is
++// derived from the painted body print regions instead and the per-layer
++// remap is stored in LayerTools::image_map_filament_resolution, mirroring
++// the existing resolve_mixed_filaments() mechanism.
++//
++// LOW-CONFIDENCE MAPPING NOTE (AMS/multi-material internals): the origin
++// resolves zones inside collect_extruders() while Bambu Studio's tool
++// ordering additionally performs multi-extruder filament grouping and
++// flush-volume reordering (H2C / dual-nozzle machines). This port therefore
++// collapses filaments *before* reorder_extruders_for_minimum_flush_volume(),
++// exactly where resolve_mixed_filaments() already does the same kind of
++// remap, so all downstream grouping (including the H2C paths in
++// reorder_extruders_for_minimum_flush_volume) sees ordinary physical
++// filaments and is otherwise untouched.
++void ToolOrdering::resolve_image_map_per_layer_filaments(const PrintConfig &config)
++{
++    m_image_map_rotation.clear();
++    // Default OFF: everything below is skipped and no LayerTools state changes.
++    if (!ImageMapPerLayer::enabled(config))
++        return;
++    if (m_print == nullptr)
++        return;
++    // Conservative: never combine with the mixed-filament (virtual slot)
++    // feature — the two per-layer remaps would interact in untested ways.
++    if (has_any_mixed_filament(config.filament_is_mixed.values))
++        return;
++
++    const std::vector<unsigned int> rotation = ImageMapPerLayer::rotation_filaments(*m_print);
++    if (rotation.size() < 2)
++        return;
++    const std::vector<unsigned int> sequence = ImageMapPerLayer::rotation_sequence(rotation);
++    if (sequence.empty())
++        return;
++
++    const std::set<unsigned int> rotation_set(rotation.begin(), rotation.end());
++    for (LayerTools &lt : m_layer_tools) {
++        const size_t layer_idx = size_t(&lt - m_layer_tools.data());
++        const unsigned int active = ImageMapPerLayer::active_filament_for_layer(sequence, int(layer_idx));
++        // Map every rotation filament on every layer so LayerTools::extruder()
++        // can never hand out a body filament that was removed from
++        // lt.extruders below (which would silently drop extrusions).
++        for (unsigned int filament : rotation)
++            lt.image_map_filament_resolution[filament] = active;
++
++        bool any_replaced = false;
++        std::vector<unsigned int> new_extruders;
++        new_extruders.reserve(lt.extruders.size());
++        for (unsigned int ext : lt.extruders) {
++            if (rotation_set.count(ext)) {
++                new_extruders.push_back(active);
++                any_replaced = true;
++            } else {
++                // Support / interface / other protected filaments keep their
++                // native tool-change path (H2C included).
++                new_extruders.push_back(ext);
++            }
++        }
++        if (any_replaced) {
++            lt.extruders = std::move(new_extruders);
++            sort_remove_duplicates(lt.extruders);
++        }
++    }
++    m_image_map_rotation = rotation;
++}
++
+ void ToolOrdering::enforce_mixed_component_order()
+ {
+     for (LayerTools &lt : m_layer_tools) {
+diff --git a/src/libslic3r/GCode/ToolOrdering.hpp b/src/libslic3r/GCode/ToolOrdering.hpp
+index 8735207..43f9d60 100644
+--- a/src/libslic3r/GCode/ToolOrdering.hpp
++++ b/src/libslic3r/GCode/ToolOrdering.hpp
+@@ -211,6 +211,19 @@ public:
+         return (it != mixed_filament_resolution.end()) ? it->second : filament_0based;
+     }
+ 
++    // Image-map per-layer color rotation (ported from OrcaSlicer-ImageMap,
++    // ToolOrdering.cpp zone resolution; see ImageMapPerLayerColor.hpp).
++    // 0-based painted body filament → the single 0-based filament this layer is
++    // printed with. Populated by ToolOrdering::resolve_image_map_per_layer_filaments()
++    // only when image_map_per_layer_color_rotation is enabled; otherwise the map
++    // stays empty and resolve_image_map() is the identity (strict no-op).
++    std::map<unsigned int, unsigned int> image_map_filament_resolution;
++
++    unsigned int resolve_image_map(unsigned int filament_0based) const {
++        auto it = image_map_filament_resolution.find(filament_0based);
++        return (it != image_map_filament_resolution.end()) ? it->second : filament_0based;
++    }
++
+     struct MixedSubLayerGroup {
+         unsigned int              mixed_slot_0based;
+         std::vector<unsigned int> components_0based;
+@@ -321,6 +334,10 @@ public:
+     // resolve_mixed_filaments() expanded them to physical components. Empty when unused.
+     const std::vector<unsigned int>& used_mixed_filaments() const { return m_used_mixed_filaments; }
+ 
++    // Image-map per-layer color rotation set (0-based, sorted). Empty unless the
++    // image_map_per_layer_color_rotation feature is enabled and applicable.
++    const std::vector<unsigned int>& image_map_rotation_filaments() const { return m_image_map_rotation; }
++
+     // Find LayerTools with the closest print_z.
+     const LayerTools&	tools_for_layer(coordf_t print_z) const;
+     LayerTools&			tools_for_layer(coordf_t print_z) { return const_cast<LayerTools&>(std::as_const(*this).tools_for_layer(print_z)); }
+@@ -408,6 +425,10 @@ private:
+     void                reorder_extruders_for_minimum_flush_volume(bool reorder_first_layer);
+     void                resolve_mixed_filaments(const PrintConfig &config);
+     void                enforce_mixed_component_order();
++    // Image-map per-layer color rotation (ported from OrcaSlicer-ImageMap):
++    // collapses painted body tool changes to one filament per layer. Strict
++    // no-op unless image_map_per_layer_color_rotation is enabled.
++    void                resolve_image_map_per_layer_filaments(const PrintConfig &config);
+ 
+     // BBS
+     std::vector<unsigned int> generate_first_layer_tool_order(const Print& print);
+@@ -429,6 +450,10 @@ private:
+     // 0-based mixed slots actually present in any LayerTools::extruders before resolution.
+     std::vector<unsigned int> m_used_mixed_filaments;
+ 
++    // Image-map per-layer color rotation: the sorted 0-based body filament set the
++    // print cycles through. Empty unless image_map_per_layer_color_rotation is on.
++    std::vector<unsigned int> m_image_map_rotation;
++
+     // All layer indices (in m_layer_tools) where each object has any layer.
+     // Used by gradient run detection to distinguish real gaps (object has a layer
+     // that doesn't use the slot) from spurious gaps (another object's layer).
+diff --git a/src/libslic3r/Preset.cpp b/src/libslic3r/Preset.cpp
+index 632b750..4e0d57b 100644
+--- a/src/libslic3r/Preset.cpp
++++ b/src/libslic3r/Preset.cpp
+@@ -1059,6 +1059,10 @@ static std::vector<std::string> s_Preset_print_options {
+     "prime_tower_flat_ironing","enable_circle_compensation", "circle_compensation_manual_offset", "apply_scarf_seam_on_circles",
+     "wipe_tower_no_sparse_layers", "compatible_printers", "compatible_printers_condition", "inherits",
+     "flush_into_infill", "flush_into_objects", "flush_into_support","process_notes", "enable_mixed_color_sublayer",
++    // Image-map per-layer color rotation (ported from OrcaSlicer-ImageMap); default off.
++    "image_map_per_layer_color_rotation", "texture_mapping_outer_wall_gradient_global_strength",
++    "texture_mapping_outer_wall_gradient_max_line_width", "texture_mapping_outer_wall_gradient_min_line_width",
++    "image_map_generic_solver_lookup_mode", "image_map_generic_solver_mode", "image_map_generic_solver_mix_model",
+     // BBS
+      "tree_support_branch_angle", "tree_support_wall_count", "tree_support_branch_distance", "tree_support_branch_diameter",
+     "tree_support_branch_diameter_angle",
+diff --git a/src/libslic3r/PrintConfig.cpp b/src/libslic3r/PrintConfig.cpp
+index 7d8ab09..49c7ab4 100644
+--- a/src/libslic3r/PrintConfig.cpp
++++ b/src/libslic3r/PrintConfig.cpp
+@@ -6050,6 +6050,79 @@ void PrintConfigDef::init_fff_params()
+     def->mode = comSimple;
+     def->set_default_value(new ConfigOptionBool(false));
+ 
++    // Image-map per-layer color rotation (Phase 1 port from OrcaSlicer-ImageMap,
++    // https://github.com/sentientstardust-dev/OrcaSlicer-ImageMap
++    // release v1.0.22, commit 92548381056dbf72836b0a1bdc455f238218dbfb).
++    // Master toggle: default OFF. With it off every code path of the feature is
++    // a strict no-op and slicing output is unchanged.
++    def = this->add("image_map_per_layer_color_rotation", coBool);
++    def->label = L("Image-map per-layer color rotation");
++    def->tooltip = L("Experimental. Collapse multi-color (painted) tool changes to at most one tool "
++                     "change per layer, cycling through the painted filaments across layers, and "
++                     "approximate the painted colors by modulating the outer wall line width. "
++                     "Ported from OrcaSlicer-ImageMap.");
++    def->mode = comDevelop;
++    def->set_default_value(new ConfigOptionBool(false));
++
++    // The following three options are ported verbatim from OrcaSlicer-ImageMap
++    // PrintConfig.cpp (same names, defaults and ranges).
++    def = this->add("texture_mapping_outer_wall_gradient_global_strength", coFloat);
++    def->label = L("Outer wall offset gradient global strength");
++    def->category = L("Multimaterial");
++    def->tooltip = L("Global strength multiplier for texture mapping outer wall offset gradients.");
++    def->sidetext = "%";
++    def->min = 0.0;
++    def->max = 100.0;
++    def->mode = comDevelop;
++    def->set_default_value(new ConfigOptionFloat(100.0));
++
++    def = this->add("texture_mapping_outer_wall_gradient_max_line_width", coFloat);
++    def->label = L("Maximum outer wall line width");
++    def->category = L("Multimaterial");
++    def->tooltip = L("Upper bound for external perimeter line width used by texture mapping.");
++    def->sidetext = "mm";
++    def->min = 0.05;
++    def->max = 3.0;
++    def->mode = comDevelop;
++    def->set_default_value(new ConfigOptionFloat(0.95));
++
++    def = this->add("texture_mapping_outer_wall_gradient_min_line_width", coFloat);
++    def->label = L("Minimum outer wall line width");
++    def->category = L("Multimaterial");
++    def->tooltip = L("Lower bound for external perimeter line width used by texture mapping outer wall gradient effects.");
++    def->sidetext = "mm";
++    def->min = 0.05;
++    def->max = 2.0;
++    def->mode = comDevelop;
++    def->set_default_value(new ConfigOptionFloat(0.32));
++
++    // Generic solver configuration (defaults match the OrcaSlicer-ImageMap
++    // TextureMappingZone defaults; 255 = "slicer default" sentinel resolving to
++    // the Oklab soft-cap solver).
++    def = this->add("image_map_generic_solver_lookup_mode", coInt);
++    def->label = L("Image-map generic solver lookup mode");
++    def->tooltip = L("0: closest mix, 1: blend closest two. Ported from OrcaSlicer-ImageMap.");
++    def->min = 0;
++    def->max = 1;
++    def->mode = comDevelop;
++    def->set_default_value(new ConfigOptionInt(0));
++
++    def = this->add("image_map_generic_solver_mode", coInt);
++    def->label = L("Image-map generic solver mode");
++    def->tooltip = L("0: RGB, 1: Oklab, 2: Oklab soft-cap, 255: slicer default. Ported from OrcaSlicer-ImageMap.");
++    def->min = 0;
++    def->max = 255;
++    def->mode = comDevelop;
++    def->set_default_value(new ConfigOptionInt(255));
++
++    def = this->add("image_map_generic_solver_mix_model", coInt);
++    def->label = L("Image-map generic solver mix model");
++    def->tooltip = L("0: Pigment Painter, 1: prusa-fdm-mixer. Ported from OrcaSlicer-ImageMap.");
++    def->min = 0;
++    def->max = 1;
++    def->mode = comDevelop;
++    def->set_default_value(new ConfigOptionInt(0));
++
+     def = this->add("enable_prime_tower", coBool);
+     def->label = L("Enable");
+     def->tooltip = L("The wiping tower can be used to clean up the residue on the nozzle and stabilize the chamber pressure inside the nozzle, "
+diff --git a/src/libslic3r/PrintConfig.hpp b/src/libslic3r/PrintConfig.hpp
+index 0f1319c..89e2b87 100644
+--- a/src/libslic3r/PrintConfig.hpp
++++ b/src/libslic3r/PrintConfig.hpp
+@@ -1514,6 +1514,14 @@ PRINT_CONFIG_CLASS_DERIVED_DEFINE(
+     ((ConfigOptionInts,               nozzle_temperature_range_high))
+     ((ConfigOptionFloatsNullable,     wipe_distance))
+     ((ConfigOptionBool,               enable_mixed_color_sublayer))
++    // Image-map per-layer color rotation (ported from OrcaSlicer-ImageMap); default off.
++    ((ConfigOptionBool,               image_map_per_layer_color_rotation))
++    ((ConfigOptionFloat,              texture_mapping_outer_wall_gradient_global_strength))
++    ((ConfigOptionFloat,              texture_mapping_outer_wall_gradient_max_line_width))
++    ((ConfigOptionFloat,              texture_mapping_outer_wall_gradient_min_line_width))
++    ((ConfigOptionInt,                image_map_generic_solver_lookup_mode))
++    ((ConfigOptionInt,                image_map_generic_solver_mode))
++    ((ConfigOptionInt,                image_map_generic_solver_mix_model))
+     ((ConfigOptionBool,               enable_prime_tower))
+     ((ConfigOptionBool,               prime_tower_enable_framework))
+     // BBS: change wipe_tower_x and wipe_tower_y data type to floats to add partplate logic
