@@ -18,7 +18,9 @@ log() { printf '\n\033[1;34m==>\033[0m %s\n' "$*"; }
 die() { printf '\n\033[1;31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 trap 'die "build failed at line $LINENO (last command: $BASH_COMMAND)"' ERR
 
-REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+if ! REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)"; then
+  REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+fi
 cd "$REPO_ROOT"
 
 BASE_COMMIT="926a7192574bcb9b3a732e1ec59a46d79cb45466"   # v02.08.02.61, the base the ImageMap patch was made against
