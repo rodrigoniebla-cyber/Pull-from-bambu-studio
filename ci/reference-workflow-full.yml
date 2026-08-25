@@ -1,0 +1,199 @@
+name: Build macOS DMG (ImageMap port)
+
+# Builds the Bambu Studio "one tool-change per layer" image-map port
+# (this repository's overlay) for macOS and publishes a ready-to-download
+# arm64 .dmg as a GitHub Release.
+#
+# The upstream sources are NOT part of this repository — this workflow clones
+# bambulab/BambuStudio at the pinned base commit, applies ./apply.sh (new
+# files + patch), then builds with upstream's own BuildMac.sh, mirroring the
+# steps of upstream's .github/workflows/build_deps.yml / build_bambu.yml.
+#
+# Job 1 (deps)   : builds the Bambu Studio dependency bundle for macOS
+#                  (arm64 / Apple Silicon). Cached — subsequent runs skip it.
+# Job 2 (dmg)    : applies the port, builds the slicer, packs the DMG,
+#                  uploads it as a workflow artifact and attaches it to a
+#                  GitHub Release.
+#
+# NOTE: builds happen on this branch only (no merge to main required).
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - arena/01a03659-pull-from-bambu-studio
+    paths:
+      - '.github/workflows/build-macos-dmg.yml'
+      - 'apply.sh'
+      - 'bambustudio/**'
+      - 'patches/**'
+
+permissions:
+  contents: write # required to create the Release with the DMG
+
+concurrency:
+  group: build-macos-dmg-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  BASE_REPO: bambulab/BambuStudio
+  BASE_SHA: 926a7192574bcb9b3a732e1ec59a46d79cb45466 # v02.08.02.61 — the commit this port is pinned to
+  DEPS_TARBALL: BambuStudio_dep_mac_arm64.tar.gz
+  RELEASE_TAG: imagemap-v02.08.02.61
+
+jobs:
+  deps:
+    name: Deps (arm64, cached)
+    runs-on: macos-26
+    timeout-minutes: 350
+
+    steps:
+      - name: Restore cached dependency bundle
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.DEPS_TARBALL }}
+          key: bs-deps-macos26-arm64-${{ env.BASE_SHA }}
+
+      - name: Clone upstream Bambu Studio (base commit)
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          git init BambuStudio
+          cd BambuStudio
+          git remote add origin "https://github.com/${BASE_REPO}.git"
+          git fetch --depth 1 origin "$BASE_SHA"
+          git checkout FETCH_HEAD
+
+      - name: Install build prerequisites (as upstream CI)
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          brew install automake texinfo nasm yasm x264
+          brew uninstall --ignore-dependencies zstd || true
+          brew unlink cmake || true
+          brew tap-new "$USER/old-cmake"
+          brew extract --version=3.31.0 cmake "$USER/old-cmake"
+          brew install "$USER/old-cmake/cmake@3.31.0"
+          brew link --overwrite cmake@3.31.0
+          brew pin cmake@3.31.0
+
+      - name: Build deps (arm64)
+        if: steps.cache.outputs.cache-hit != 'true'
+        working-directory: BambuStudio
+        run: ./BuildMac.sh -d -x -a arm64 -t 10.15 -1
+
+      - name: Trim deps tree and pack tarball
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          (cd BambuStudio/deps/build/arm64 && \
+           find . -mindepth 1 -maxdepth 1 ! -name 'BambuStudio_deps' -exec rm -rf {} +)
+          brew install zstd || true
+          tar -czf "$DEPS_TARBALL" -C BambuStudio deps/build
+          ls -lh "$DEPS_TARBALL"
+
+      - name: Save dependency bundle to cache
+        if: steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.DEPS_TARBALL }}
+          key: bs-deps-macos26-arm64-${{ env.BASE_SHA }}
+
+      - name: Upload dependency bundle artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bs-deps-arm64
+          path: ${{ env.DEPS_TARBALL }}
+          retention-days: 14
+
+  dmg:
+    name: Slicer + DMG (arm64)
+    needs: deps
+    runs-on: macos-26
+    timeout-minutes: 350
+
+    steps:
+      - name: Checkout this repository (the port overlay)
+        uses: actions/checkout@v4
+
+      - name: Clone upstream Bambu Studio (base commit)
+        run: |
+          git init BambuStudio
+          cd BambuStudio
+          git remote add origin "https://github.com/${BASE_REPO}.git"
+          git fetch --depth 1 origin "$BASE_SHA"
+          git checkout FETCH_HEAD
+
+      - name: Download prebuilt deps
+        uses: actions/download-artifact@v4
+        with:
+          name: bs-deps-arm64
+
+      - name: Unpack deps into the build tree
+        run: |
+          tar -xzf "$DEPS_TARBALL" -C BambuStudio
+          ls BambuStudio/deps/build/arm64
+
+      - name: Apply the ImageMap port (new files + patch)
+        run: |
+          ./apply.sh "$PWD/BambuStudio" | tail -15
+          cd BambuStudio
+          git diff --stat | tail -3
+
+      - name: Install build prerequisites (as upstream CI)
+        run: |
+          brew install automake texinfo
+          brew unlink cmake || true
+          brew tap-new "$USER/old-cmake"
+          brew extract --version=3.31.0 cmake "$USER/old-cmake"
+          brew install "$USER/old-cmake/cmake@3.31.0"
+          brew link --overwrite cmake@3.31.0
+          brew pin cmake@3.31.0
+
+      - name: Build slicer (arm64)
+        working-directory: BambuStudio
+        run: ./BuildMac.sh -s -x -a arm64 -t 10.15 -1
+
+      - name: Ad-hoc codesign app bundle
+        run: |
+          APP="BambuStudio/build/arm64/BambuStudio/BambuStudio.app"
+          codesign --force --deep --sign - "$APP" || echo "::warning::ad-hoc codesign failed, continuing unsigned"
+          codesign --verify --verbose "$APP" || true
+
+      - name: Pack DMG
+        run: |
+          VER=$(grep 'set(SLIC3R_VERSION' BambuStudio/version.inc | cut -d '"' -f2)
+          echo "APP_VERSION=$VER" >> "$GITHUB_ENV"
+          DMG="BambuStudio_arm64_V${VER}_ImageMap.dmg"
+          mkdir -p dmgroot
+          cp -R "BambuStudio/build/arm64/BambuStudio/BambuStudio.app" dmgroot/
+          ln -s /Applications dmgroot/Applications
+          hdiutil create -volname "Bambu Studio" -srcfolder dmgroot -ov -format UDZO "$DMG"
+          ls -lh "$DMG"
+
+      - name: Upload DMG as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: BambuStudio_macOS_arm64_ImageMap
+          path: BambuStudio_arm64_*_ImageMap.dmg
+          retention-days: 14
+
+      - name: Attach DMG to GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          DMG=$(ls BambuStudio_arm64_*_ImageMap.dmg)
+          if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release create "$RELEASE_TAG" \
+              --target "$GITHUB_SHA" \
+              --title "Bambu Studio ${APP_VERSION} — ImageMap per-layer color port (macOS arm64)" \
+              --notes "Bambu Studio v${APP_VERSION} with the \"one tool-change per layer\" image/texture color printing port enabled.
+
+          Built from branch \`${GITHUB_REF_NAME}\` commit \`${GITHUB_SHA}\` (upstream base: ${BASE_REPO}@${BASE_SHA}).
+
+          **Download:** \`${DMG}\` — Apple Silicon (M1/M2/M3/M4), macOS 10.15+.
+
+          > ⚠️ The app is **not notarized/developer-signed** (fork build). On first launch macOS Gatekeeper will warn:
+          > right-click the app → **Open** → **Open**, or run \`xattr -cr /Applications/BambuStudio.app\` after dragging it to Applications.
+
+          The feature ships **off by default** — enable *\"Image-map per-layer color rotation\"* in the print settings (develop mode)."
+          fi
+          gh release upload "$RELEASE_TAG" "$DMG" --clobber
